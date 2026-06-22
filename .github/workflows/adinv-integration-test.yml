@@ -32,8 +32,9 @@ env:
 jobs:
   adinv-integration:
     name: AD DS inventory integration
+    # windows-2025 has Server SKU with AD DS role available.
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -43,8 +44,10 @@ jobs:
         with:
           go-version: oldstable
 
+      # Hosted runners cannot reboot mid-job; promotion uses -NoRebootOnCompletion
+      # and the setup script force-starts NTDS/ADWS/DNS for LDAP access.
       - name: Install and configure full AD DS forest
-        shell: pwsh
+        shell: powershell
         run: |
           $script = Join-Path $env:GITHUB_WORKSPACE "receiver\activedirectoryinvreceiver\testdata\integration\setup-ad-ds.ps1"
           & $script
