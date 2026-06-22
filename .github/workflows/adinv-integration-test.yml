@@ -72,24 +72,25 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
           Write-Host "Probing LDAP via server=$server"
-          # Parse host:port from AD_LDAP_SERVER (dsamain often listens on 10389, not 389)
-          $host = "127.0.0.1"
-          $port = 389
+          # Parse host:port from AD_LDAP_SERVER (dsamain often listens on 10389, not 389).
+          # Do not use $host — it is a read-only automatic variable in PowerShell.
+          $ldapHost = "127.0.0.1"
+          $ldapPort = 389
           if ($server -match '^([^:]+):(\d+)$') {
-            $host = $Matches[1]
-            $port = [int]$Matches[2]
+            $ldapHost = $Matches[1]
+            $ldapPort = [int]$Matches[2]
           } elseif ($server) {
-            $host = $server
+            $ldapHost = $server
           }
           $tcp = New-Object System.Net.Sockets.TcpClient
-          $iar = $tcp.BeginConnect($host, $port, $null, $null)
+          $iar = $tcp.BeginConnect($ldapHost, $ldapPort, $null, $null)
           if (-not $iar.AsyncWaitHandle.WaitOne(5000, $false)) {
             $tcp.Close()
-            throw "TCP ${host}:${port} not accepting connections within 5s"
+            throw "TCP ${ldapHost}:${ldapPort} not accepting connections within 5s"
           }
-          try { $tcp.EndConnect($iar) } catch { $tcp.Close(); throw "TCP ${host}:${port} connect failed: $_" }
+          try { $tcp.EndConnect($iar) } catch { $tcp.Close(); throw "TCP ${ldapHost}:${ldapPort} connect failed: $_" }
           $tcp.Close()
-          Write-Host "TCP ${host}:${port} open"
+          Write-Host "TCP ${ldapHost}:${ldapPort} open"
           $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$server/RootDSE")
           $nc = $root.Properties["defaultNamingContext"].Value
           Write-Host "defaultNamingContext=$nc"
