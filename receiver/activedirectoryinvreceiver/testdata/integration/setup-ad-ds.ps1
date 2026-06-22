@@ -352,25 +352,32 @@ mode=dsamain-mount
 ntds_dit=$NtdsPath
 "@
     Write-Step "AD DS integration environment ready"
-    Get-Content $MarkerFile
+    Get-Content $MarkerFile | ForEach-Object { Write-Host $_ }
+    Write-Host "setup-ad-ds.ps1: seeding/marker done, returning to caller"
+}
+
+# Ensure caller always gets a clear terminal line before we exit the script body.
+function Finish-SetupSuccess {
+    Write-Host "setup-ad-ds.ps1: SUCCESS exit 0"
+    exit 0
 }
 
 # ---------- main ----------
 
 if (Test-Path $MarkerFile) {
     Write-Step "AD DS already configured (marker present)"
-    Get-Content $MarkerFile
+    Get-Content $MarkerFile | ForEach-Object { Write-Host $_ }
     # Ensure dsamain is still running for this job.
     if (-not (Test-ADReady)) {
         $null = Start-DsaMainMount
     }
-    exit 0
+    Finish-SetupSuccess
 }
 
 if (Test-ADReady) {
     Write-Step "LDAP already reachable; seeding if needed"
     Seed-TestDirectoryData
-    exit 0
+    Finish-SetupSuccess
 }
 
 # Phase 1: install + promote (unless already done)
@@ -396,7 +403,7 @@ Start-Sleep -Seconds 3
 if (Test-ADReady) {
     Write-Log "NTDS is serving LDAP natively"
     Seed-TestDirectoryData
-    exit 0
+    Finish-SetupSuccess
 }
 
 # Hosted-runner path: mount the promoted AD DS database with dsamain.
@@ -406,4 +413,4 @@ if (-not (Start-DsaMainMount)) {
 }
 
 Seed-TestDirectoryData
-exit 0
+Finish-SetupSuccess
