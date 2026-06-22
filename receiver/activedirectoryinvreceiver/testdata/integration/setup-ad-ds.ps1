@@ -95,28 +95,50 @@ function Test-ADReady {
 }
 
 function Set-StaticIPForDC {
-    Write-Step "Pinning static IPv4 on primary adapter"
+    Write-Step "Pinning static IPv4 on primary adapter (reduces DCPromo network errors on GHA)"
     try {
         $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.HardwareInterface } | Select-Object -First 1
         if (-not $adapter) {
             $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
         }
-        if (-not $adapter) { return }
+        if (-not $adapter) { Write-Log "No up adapter found"; return }
         $ipcfg = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1
-        if (-not $ipcfg) { return }
+        if (-not $ipcfg) { Write-Log "No usable IPv4 on adapter"; return }
         $ip = $ipcfg.IPAddress
         $prefix = $ipcfg.PrefixLength
         $gw = (Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
             Sort-Object RouteMetric | Select-Object -First 1).NextHop
-        Write-Log "Adapter=$($adapter.Name) IP=$ip/$prefix GW=$gw"
+        Write-Log "Adapter=$($adapter.Name) ifIndex=$($adapter.ifIndex) IP=$ip/$prefix GW=$gw"
+        # Remove existing IPv4 on interface then re-add as static (same address keeps connectivity)
+        Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -eq $ip } |
+            ForEach-Object {
+                try { Remove-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            }
         try {
-            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null
-        } catch {}
-        if ($gw) {
-            New-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -NextHop $gw -ErrorAction SilentlyContinue | Out-Null
+            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gw -ErrorAction Stop | Out-Null
+        } catch {
+            try {
+                New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null
+            } catch {
+                Write-Log "New-NetIPAddress note: $_"
+            }
+            if ($gw) {
+                New-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -NextHop $gw -ErrorAction SilentlyContinue | Out-Null
+            }
         }
         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($ip, "127.0.0.1") -ErrorAction SilentlyContinue
+        # Disable IPv6 on primary adapter — DCPromo often warns/fails when IPv6 is enabled without static v6
+        try {
+            Disable-NetAdapterBinding -Name $adapter.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+            Write-Log "Disabled IPv6 binding on $($adapter.Name)"
+        } catch {
+            Write-Log "IPv6 disable note: $_"
+        }
+        $verify = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -eq $ip } | Select-Object -First 1
+        Write-Log "Static IP verify: Address=$($verify.IPAddress) PrefixOrigin=$($verify.PrefixOrigin) AddressState=$($verify.AddressState)"
     } catch {
         Write-Log "WARNING: Set-StaticIPForDC: $_"
     }
@@ -127,7 +149,7 @@ function Install-ADDSForestOnce {
     Write-Log "NOTE: Install-ADDSForest often takes 10-20 min with little output; heartbeats prove progress."
     $winPsScriptPath = "$env:TEMP\otel-install-addsforest.ps1"
     $lines = @(
-        "`$ErrorActionPreference = 'Continue'"
+        "`$ErrorActionPreference = 'Stop'"
         "Import-Module ADDSDeployment -Force"
         "`$securePw = ConvertTo-SecureString '$SafeModePassword' -AsPlainText -Force"
         "try {"
@@ -143,12 +165,19 @@ function Install-ADDSForestOnce {
         "        -LogPath 'C:\Windows\NTDS' ``"
         "        -SysvolPath 'C:\Windows\SYSVOL'"
         "    `$r | Format-List | Out-String | Write-Output"
+        "    if (`$r.Status -and (`$r.Status.ToString() -ne 'Success')) {"
+        "        Write-Output `"INSTALL_STATUS_ERROR: `$(`$r | Format-List | Out-String)`""
+        "        exit 2"
+        "    }"
+        "    exit 0"
         "} catch {"
         "    Write-Output `"INSTALL_ERROR: `$_`""
+        "    exit 1"
         "}"
     )
     Set-Content -Path $winPsScriptPath -Value $lines -Encoding UTF8
     Start-Heartbeat -Label "Install-ADDSForest" -IntervalSec 30
+    $ok = $false
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -167,9 +196,48 @@ function Install-ADDSForestOnce {
         if ($stdout) { Write-Log $stdout }
         if ($stderr) { Write-Log "stderr: $stderr" }
         Write-Log "Install-ADDSForest child exit=$($proc.ExitCode)"
+        $combined = "$stdout`n$stderr"
+        if ($proc.ExitCode -eq 0 -and $combined -notmatch "INSTALL_ERROR|INSTALL_STATUS_ERROR|Status\s*:\s*Error") {
+            $ok = $true
+        }
     } finally {
         Stop-Heartbeat
     }
+    return $ok
+}
+
+function Install-ADDSForestWithRetry {
+    param([int]$MaxAttempts = 3)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Log "Install-ADDSForest attempt $attempt of $MaxAttempts"
+        # Clean partial promote artifacts between attempts
+        if ($attempt -gt 1) {
+            Write-Log "Cleaning partial forest state before retry"
+            try {
+                $null = & sc.exe stop NTDS 2>&1
+                $null = & sc.exe stop ADWS 2>&1
+                $null = & sc.exe stop DNS 2>&1
+                Start-Sleep -Seconds 3
+            } catch {}
+            foreach ($p in @("C:\Windows\NTDS", "C:\Windows\SYSVOL")) {
+                if (Test-Path $p) {
+                    try { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+                }
+            }
+            Set-StaticIPForDC
+            Start-Sleep -Seconds 5
+        }
+        if (Install-ADDSForestOnce) {
+            if (Test-Path $NtdsPath) {
+                Write-Log "Install-ADDSForest succeeded; ntds.dit present size=$((Get-Item $NtdsPath).Length)"
+                return $true
+            }
+            Write-Log "Install reported success but ntds.dit missing; will retry if attempts remain"
+        } else {
+            Write-Log "Install-ADDSForest attempt $attempt failed"
+        }
+    }
+    return $false
 }
 
 function Stop-DsaMainIfRunning {
@@ -470,11 +538,28 @@ if (-not (Test-Path $Phase1Marker)) {
         Write-Log "AD-Domain-Services already installed"
     }
 
-    Install-ADDSForestOnce
+    if (-not (Install-ADDSForestWithRetry -MaxAttempts 3)) {
+        Write-Error "Install-ADDSForest failed after retries; refusing to write phase marker"
+        exit 1
+    }
+    if (-not (Test-Path $NtdsPath)) {
+        Write-Error "ntds.dit missing after successful promote claim; aborting"
+        exit 1
+    }
     Set-Content -Path $Phase1Marker -Value "promoted=$(Get-Date -Format o)"
     Write-Log "Phase 1 marker written; proceeding to NTDS/dsamain"
 } else {
     Write-Step "Phase marker present; skipping forest install"
+    if (-not (Test-Path $NtdsPath)) {
+        Write-Log "Phase marker present but ntds.dit missing; clearing marker and re-promoting"
+        Remove-Item $Phase1Marker -Force -ErrorAction SilentlyContinue
+        Set-StaticIPForDC
+        if (-not (Install-ADDSForestWithRetry -MaxAttempts 3)) {
+            Write-Error "Re-promote failed"
+            exit 1
+        }
+        Set-Content -Path $Phase1Marker -Value "promoted=$(Get-Date -Format o)"
+    }
 }
 
 # Try native NTDS first (works after real reboot on self-hosted runners).
