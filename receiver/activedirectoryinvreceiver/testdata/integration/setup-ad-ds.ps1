@@ -131,21 +131,21 @@ function Stop-DsaMainIfRunning {
 }
 
 function Start-DsaMainMount {
-    Write-Step "Mounting AD DS database with dsamain on LDAP port $LdapPort - works without NTDS reboot"
+    Write-Step "Mounting AD DS database with dsamain - works without NTDS reboot"
     if (-not (Test-Path $NtdsPath)) {
         Write-Error "ntds.dit not found at $NtdsPath; forest promotion may have failed"
         return $false
     }
 
-    # NTDS service must be stopped so the dit is not exclusively locked.
+    # NTDS must be fully stopped; incomplete promotion often leaves locks on the live dit.
     $null = & sc.exe stop NTDS 2>&1
-    Start-Sleep -Seconds 2
+    $null = & sc.exe stop ADWS 2>&1
+    Start-Sleep -Seconds 3
 
     Stop-DsaMainIfRunning
 
     $dsamain = Join-Path $env:SystemRoot "System32\dsamain.exe"
     if (-not (Test-Path $dsamain)) {
-        # AD DS RSAT / role should provide this; search common locations.
         $found = Get-ChildItem -Path "$env:SystemRoot\System32","$env:SystemRoot\SysWOW64" -Filter dsamain.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) { $dsamain = $found.FullName }
     }
@@ -154,38 +154,108 @@ function Start-DsaMainMount {
         return $false
     }
 
-    Write-Log "Starting: $dsamain -dbpath $NtdsPath -ldapport $LdapPort -allowNonAdminAccess"
-    $p = Start-Process -FilePath $dsamain -ArgumentList @(
-        "-dbpath", $NtdsPath,
-        "-ldapport", "$LdapPort",
-        "-allowNonAdminAccess"
-    ) -PassThru -WindowStyle Hidden
-    Set-Content -Path $DsaMainPidFile -Value $p.Id
+    # Copy the promoted database + logs so dsamain does not fight live NTDS paths.
+    $mountDir = "C:\otel-ntds-mount"
+    if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $mountDir -Force | Out-Null
+    Copy-Item -Path $NtdsPath -Destination (Join-Path $mountDir "ntds.dit") -Force
+    Get-ChildItem "C:\Windows\NTDS" -Filter "edb*.log" -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName -Destination $mountDir -Force -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem "C:\Windows\NTDS" -Filter "edb.chk" -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName -Destination $mountDir -Force -ErrorAction SilentlyContinue
+    }
+    $mountDit = Join-Path $mountDir "ntds.dit"
+    Write-Log "Copied ntds.dit to $mountDit size=$((Get-Item $mountDit).Length)"
 
-    # Export for subsequent steps / go tests.
-    $env:AD_LDAP_SERVER = "127.0.0.1"
-    if ($LdapPort -ne 389) {
-        $env:AD_LDAP_SERVER = "127.0.0.1:$LdapPort"
-    }
-    # Persist for other workflow steps in the same job via GITHUB_ENV.
-    if ($env:GITHUB_ENV) {
-        Add-Content -Path $env:GITHUB_ENV -Value "AD_LDAP_SERVER=$($env:AD_LDAP_SERVER)"
-        Add-Content -Path $env:GITHUB_ENV -Value "AD_BASE_DN=CN=Users,DC=oteltest,DC=local"
+    # Soft-recover the copy if the jet database was left dirty mid-promotion.
+    $esentutl = Join-Path $env:SystemRoot "System32\esentutl.exe"
+    if (Test-Path $esentutl) {
+        Write-Log "Running esentutl /r against mount dir if needed"
+        Push-Location $mountDir
+        try {
+            & $esentutl /r edb /l $mountDir /s $mountDir 2>&1 | ForEach-Object { Write-Log "esentutl: $_" }
+        } catch {
+            Write-Log "esentutl note: $_"
+        }
+        Pop-Location
     }
 
-    for ($i = 1; $i -le 30; $i++) {
-        if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
-            Write-Log "dsamain exited early"
-            return $false
+    # Try a few ports: 389 may be held by a half-started NTDS/ADWS; 10389 is the usual dsamain lab port.
+    $portsToTry = @($LdapPort, 10389, 3389)
+    $portsToTry = $portsToTry | Select-Object -Unique
+
+    foreach ($port in $portsToTry) {
+        Stop-DsaMainIfRunning
+        $stdoutLog = "C:\otel-dsamain-$port.out.log"
+        $stderrLog = "C:\otel-dsamain-$port.err.log"
+        Remove-Item $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+
+        # dsamain accepts both - and / switch styles; use slash form (documented in AD DS tools).
+        $args = @(
+            "/dbpath:$mountDit",
+            "/ldapport:$port",
+            "/allowNonAdminAccess"
+        )
+        Write-Log "Starting: $dsamain $($args -join ' ')"
+        $p = Start-Process -FilePath $dsamain -ArgumentList $args `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog
+        Set-Content -Path $DsaMainPidFile -Value $p.Id
+
+        $env:AD_LDAP_SERVER = if ($port -eq 389) { "127.0.0.1" } else { "127.0.0.1:$port" }
+        if ($env:GITHUB_ENV) {
+            Add-Content -Path $env:GITHUB_ENV -Value "AD_LDAP_SERVER=$($env:AD_LDAP_SERVER)"
+            Add-Content -Path $env:GITHUB_ENV -Value "AD_BASE_DN=CN=Users,DC=oteltest,DC=local"
         }
-        if (Test-ADReady) {
-            Write-Log "dsamain LDAP ready (attempt $i)"
-            return $true
+
+        $ready = $false
+        for ($i = 1; $i -le 20; $i++) {
+            if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+                Write-Log "dsamain exited early on port $port"
+                if (Test-Path $stderrLog) { Get-Content $stderrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Log "dsamain-err: $_" } }
+                if (Test-Path $stdoutLog) { Get-Content $stdoutLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Log "dsamain-out: $_" } }
+                break
+            }
+            if (Test-ADReady) {
+                Write-Log "dsamain LDAP ready on port $port attempt $i server=$($env:AD_LDAP_SERVER)"
+                $ready = $true
+                break
+            }
+            Start-Sleep -Seconds 2
         }
-        Start-Sleep -Seconds 2
+
+        if ($ready) { return $true }
+
+        Stop-DsaMainIfRunning
+        # Fallback arg style with spaces (some builds prefer this)
+        Write-Log "Retrying dsamain with space-separated args on port $port"
+        $p2 = Start-Process -FilePath $dsamain -ArgumentList @(
+            "/dbpath", $mountDit,
+            "/ldapport", "$port",
+            "/allowNonAdminAccess"
+        ) -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog
+        Set-Content -Path $DsaMainPidFile -Value $p2.Id
+        for ($i = 1; $i -le 15; $i++) {
+            if (-not (Get-Process -Id $p2.Id -ErrorAction SilentlyContinue)) {
+                Write-Log "dsamain retry exited early on port $port"
+                if (Test-Path $stderrLog) { Get-Content $stderrLog -ErrorAction SilentlyContinue | Select-Object -Last 20 | ForEach-Object { Write-Log "dsamain-err: $_" } }
+                break
+            }
+            if (Test-ADReady) {
+                Write-Log "dsamain LDAP ready via retry on port $port"
+                return $true
+            }
+            Start-Sleep -Seconds 2
+        }
+        Stop-DsaMainIfRunning
     }
-    Write-Log "dsamain started but LDAP not responding yet"
-    return (Test-ADReady)
+
+    Write-Log "All dsamain attempts failed"
+    return $false
 }
 
 function Seed-TestDirectoryData {
