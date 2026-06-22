@@ -39,6 +39,38 @@ function Write-Log($msg) {
     Add-Content -Path $SetupLog -Value "$(Get-Date -Format o) $msg" -ErrorAction SilentlyContinue
 }
 
+# GitHub Actions often looks "stuck" during Install-WindowsFeature / Install-ADDSForest
+# because those cmdlets emit little/no stdout for 10-25 minutes. Keep a heartbeat so
+# humans/agents do not cancel a healthy run.
+function Start-Heartbeat {
+    param([string]$Label, [int]$IntervalSec = 30)
+    $script:HeartbeatJob = Start-Job -ScriptBlock {
+        param($lbl, $sec)
+        $n = 0
+        while ($true) {
+            $n++
+            $elapsed = $n * $sec
+            Write-Output "[heartbeat] $lbl still running... elapsed~${elapsed}s (normal; do not cancel)"
+            Start-Sleep -Seconds $sec
+        }
+    } -ArgumentList $Label, $IntervalSec
+}
+
+function Stop-Heartbeat {
+    if ($script:HeartbeatJob) {
+        Stop-Job $script:HeartbeatJob -ErrorAction SilentlyContinue
+        Receive-Job $script:HeartbeatJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        Remove-Job $script:HeartbeatJob -Force -ErrorAction SilentlyContinue
+        $script:HeartbeatJob = $null
+    }
+}
+
+function Receive-Heartbeat {
+    if ($script:HeartbeatJob) {
+        Receive-Job $script:HeartbeatJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    }
+}
+
 function Get-LdapPaths {
     $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
     return @(
@@ -92,6 +124,7 @@ function Set-StaticIPForDC {
 
 function Install-ADDSForestOnce {
     Write-Step "Installing AD DS forest: $DomainName - creates ntds.dit with NoRebootOnCompletion"
+    Write-Log "NOTE: Install-ADDSForest often takes 10-20 min with little output; heartbeats prove progress."
     $winPsScriptPath = "$env:TEMP\otel-install-addsforest.ps1"
     $lines = @(
         "`$ErrorActionPreference = 'Continue'"
@@ -115,8 +148,28 @@ function Install-ADDSForestOnce {
         "}"
     )
     Set-Content -Path $winPsScriptPath -Value $lines -Encoding UTF8
-    $out = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $winPsScriptPath 2>&1
-    Write-Log ($out | Out-String)
+    Start-Heartbeat -Label "Install-ADDSForest" -IntervalSec 30
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$winPsScriptPath`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        while (-not $proc.HasExited) {
+            Receive-Heartbeat
+            Start-Sleep -Seconds 5
+        }
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        if ($stdout) { Write-Log $stdout }
+        if ($stderr) { Write-Log "stderr: $stderr" }
+        Write-Log "Install-ADDSForest child exit=$($proc.ExitCode)"
+    } finally {
+        Stop-Heartbeat
+    }
 }
 
 function Stop-DsaMainIfRunning {
@@ -364,6 +417,15 @@ function Finish-SetupSuccess {
 
 # ---------- main ----------
 
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# AD DS integration setup (full forest, not AD LDS)       #"
+Write-Host "# Expected wall time: 15-30 minutes on GHA windows-2025   #"
+Write-Host "# Long silence during feature/forest install is NORMAL.   #"
+Write-Host "# Heartbeats print every ~30s — do NOT cancel the run.    #"
+Write-Host "############################################################"
+Write-Host ""
+
 if (Test-Path $MarkerFile) {
     Write-Step "AD DS already configured (marker present)"
     Get-Content $MarkerFile | ForEach-Object { Write-Host $_ }
@@ -385,13 +447,32 @@ if (-not (Test-Path $Phase1Marker)) {
     Set-StaticIPForDC
 
     Write-Step "Installing AD-Domain-Services Windows feature (full AD DS, not AD LDS)"
+    Write-Log "NOTE: Install-WindowsFeature often takes 5-15 min; heartbeats prove progress."
     $feature = Get-WindowsFeature -Name AD-Domain-Services
     if (-not $feature.Installed) {
-        Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null
+        Start-Heartbeat -Label "Install-WindowsFeature AD-Domain-Services" -IntervalSec 30
+        try {
+            $featJob = Start-Job -ScriptBlock {
+                Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-String
+            }
+            while ($featJob.State -eq 'Running') {
+                Receive-Heartbeat
+                Start-Sleep -Seconds 5
+            }
+            $featOut = Receive-Job $featJob
+            Remove-Job $featJob -Force -ErrorAction SilentlyContinue
+            if ($featOut) { Write-Log ($featOut | Out-String) }
+            Write-Log "Install-WindowsFeature finished"
+        } finally {
+            Stop-Heartbeat
+        }
+    } else {
+        Write-Log "AD-Domain-Services already installed"
     }
 
     Install-ADDSForestOnce
     Set-Content -Path $Phase1Marker -Value "promoted=$(Get-Date -Format o)"
+    Write-Log "Phase 1 marker written; proceeding to NTDS/dsamain"
 } else {
     Write-Step "Phase marker present; skipping forest install"
 }

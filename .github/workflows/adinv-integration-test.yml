@@ -49,8 +49,8 @@ jobs:
           go-version: oldstable
           cache-dependency-path: receiver/activedirectoryinvreceiver/go.sum
 
-      # Setup prints progress; verify+go test are inlined at the end of this step so we never
-      # appear "stuck" with no output between workflow steps after marker file is written.
+      # Setup prints progress/heartbeats; verify+go test are inlined so we never look "stuck"
+      # between workflow steps. AD forest install alone is often 15-25 min — do not cancel.
       - name: Install AD DS, verify LDAP, run integration tests
         id: setup_ad
         timeout-minutes: 55
@@ -59,12 +59,16 @@ jobs:
           AD_BASE_DN: ${{ env.AD_BASE_DN }}
         run: |
           $ErrorActionPreference = 'Continue'
+          Write-Host "==== JOB START $(Get-Date -Format o) ===="
+          Write-Host "EXPECT 15-30 min total. Heartbeats every ~30s during AD install mean progress, not hang."
+          Write-Host "Only cancel if there are zero heartbeats/logs for >10 consecutive minutes."
           Write-Host "==== STEP 1/3: setup-ad-ds.ps1 ===="
           $script = Join-Path $env:GITHUB_WORKSPACE "receiver\activedirectoryinvreceiver\testdata\integration\setup-ad-ds.ps1"
           & $script
           $code = $LASTEXITCODE
+          if ($null -eq $code) { $code = 0 }
           if ($code -ne 0) {
-            Write-Host "==== setup log tail ===="
+            Write-Host "==== setup FAILED exit=$code log tail ===="
             if (Test-Path C:\otel-ad-ds-setup.log) { Get-Content C:\otel-ad-ds-setup.log -Tail 100 }
             exit $code
           }
@@ -115,7 +119,7 @@ jobs:
           } finally {
             Pop-Location
           }
-          Write-Host "==== ALL STEPS COMPLETE ===="
+          Write-Host "==== ALL STEPS COMPLETE $(Get-Date -Format o) ===="
           exit 0
 
       # Keep this step fast: Test-NetConnection / Get-WinEvent / ADSI hang on failed runners.
