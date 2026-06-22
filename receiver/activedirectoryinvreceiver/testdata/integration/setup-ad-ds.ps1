@@ -1,19 +1,19 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Installs and configures a full Windows Active Directory Domain Services forest
-# for integration testing of the active_directory_inv receiver on GitHub Actions
-# Windows runners. Uses full AD DS (not AD LDS / lightweight directory services).
+# Installs full Windows Active Directory Domain Services (AD DS, not AD LDS) for
+# integration testing of the active_directory_inv receiver on GitHub Actions
+# Windows hosted runners.
 #
-# Phase handling (hosted runners cannot reboot mid-job reliably):
-#   - If LDAP is already up (e.g. prior promotion in this session), seed users and exit.
-#   - Otherwise install AD-Domain-Services, promote with -NoRebootOnCompletion, try to
-#     bring NTDS/ADWS/DNS/Netlogon/KDC online without reboot, seed users.
-#   - If a reboot is still required, write C:\otel-ad-phase1.marker and exit 42 so the
-#     workflow can reboot the runner and re-enter this script (phase 2).
+# Hosted runners cannot reboot mid-job, and the NTDS service will not start
+# until reboot after Install-ADDSForest. To still exercise real AD DS data via
+# ADSI/LDAP without reboot we:
+#   1. Install AD-Domain-Services + promote a forest (creates C:\Windows\NTDS\ntds.dit)
+#   2. Mount that database with dsamain.exe (AD DS diagnostic tool) on LDAP port 389
+#   3. Point ADSI at LDAP://127.0.0.1/... by exporting AD_LDAP_SERVER=127.0.0.1
+#   4. Seed users/groups through the mounted LDAP view
 #
-# Phase 2 (post-reboot on the same runner, if supported) or same-session success path
-# finishes user seeding and writes C:\otel-ad-ds-ready.marker.
+# This is still full AD DS (real ntds.dit from forest promotion), not AD LDS.
 
 $ErrorActionPreference = "Continue"
 
@@ -21,9 +21,12 @@ $DomainName = if ($env:AD_DOMAIN_NAME) { $env:AD_DOMAIN_NAME } else { "oteltest.
 $DomainNetbiosName = if ($env:AD_NETBIOS_NAME) { $env:AD_NETBIOS_NAME } else { "OTELTEST" }
 $SafeModePassword = if ($env:AD_SAFE_MODE_PASSWORD) { $env:AD_SAFE_MODE_PASSWORD } else { "P@ssw0rd123!SafeMode" }
 $TestUserPassword = if ($env:AD_TEST_USER_PASSWORD) { $env:AD_TEST_USER_PASSWORD } else { "P@ssw0rd123!User" }
+$LdapPort = if ($env:AD_LDAP_PORT) { [int]$env:AD_LDAP_PORT } else { 389 }
 $MarkerFile = "C:\otel-ad-ds-ready.marker"
 $Phase1Marker = "C:\otel-ad-phase1.marker"
 $SetupLog = "C:\otel-ad-ds-setup.log"
+$NtdsPath = "C:\Windows\NTDS\ntds.dit"
+$DsaMainPidFile = "C:\otel-dsamain.pid"
 
 function Write-Step($msg) {
     $line = "==== $msg ===="
@@ -36,12 +39,17 @@ function Write-Log($msg) {
     Add-Content -Path $SetupLog -Value "$(Get-Date -Format o) $msg" -ErrorAction SilentlyContinue
 }
 
-function Test-ADReady {
-    foreach ($path in @(
+function Get-LdapPaths {
+    $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
+    return @(
+        "LDAP://$server/RootDSE",
         "LDAP://RootDSE",
-        "LDAP://127.0.0.1/RootDSE",
         "LDAP://localhost/RootDSE"
-    )) {
+    )
+}
+
+function Test-ADReady {
+    foreach ($path in (Get-LdapPaths)) {
         try {
             $root = New-Object System.DirectoryServices.DirectoryEntry($path)
             $nc = $root.Properties["defaultNamingContext"].Value
@@ -61,68 +69,29 @@ function Set-StaticIPForDC {
         if (-not $adapter) {
             $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
         }
-        if (-not $adapter) {
-            Write-Log "WARNING: no active adapter; skipping static IP"
-            return
-        }
+        if (-not $adapter) { return }
         $ipcfg = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1
-        if (-not $ipcfg) {
-            Write-Log "WARNING: no usable IPv4; skipping static IP"
-            return
-        }
+        if (-not $ipcfg) { return }
         $ip = $ipcfg.IPAddress
         $prefix = $ipcfg.PrefixLength
         $gw = (Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
             Sort-Object RouteMetric | Select-Object -First 1).NextHop
         Write-Log "Adapter=$($adapter.Name) IP=$ip/$prefix GW=$gw"
-
-        $existingStatic = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.PrefixOrigin -eq "Manual" -and $_.IPAddress -eq $ip }
-        if ($existingStatic) {
-            Write-Log "Already static at $ip"
-        } else {
-            try {
-                New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null
-            } catch {
-                Write-Log "New-NetIPAddress note: $_"
-            }
-            if ($gw) {
-                New-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -NextHop $gw -ErrorAction SilentlyContinue | Out-Null
-            }
+        try {
+            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null
+        } catch {}
+        if ($gw) {
+            New-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -NextHop $gw -ErrorAction SilentlyContinue | Out-Null
         }
         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($ip, "127.0.0.1") -ErrorAction SilentlyContinue
-        Write-Log "DNS set to $ip / 127.0.0.1"
     } catch {
-        Write-Log "WARNING: Set-StaticIPForDC failed: $_"
-    }
-}
-
-function Start-DirectoryServices {
-    # Do NOT Restart-Service NTDS when reboot is pending — it can hang indefinitely.
-    $services = @("NTDS", "ADWS", "DNS", "Netlogon", "Kdc", "W32Time")
-    foreach ($svc in $services) {
-        try {
-            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-            if (-not $s) { continue }
-            if ($s.StartType -eq "Disabled") {
-                Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
-            }
-            if ($s.Status -ne "Running") {
-                # Use sc.exe with a short timeout feel; Start-Service can block a long time.
-                $null = & sc.exe start $svc 2>&1
-                Start-Sleep -Seconds 2
-            }
-            $s2 = Get-Service -Name $svc -ErrorAction SilentlyContinue
-            Write-Log "Service $svc -> $($s2.Status)"
-        } catch {
-            Write-Log "Service $svc error: $_"
-        }
+        Write-Log "WARNING: Set-StaticIPForDC: $_"
     }
 }
 
 function Install-ADDSForestOnce {
-    Write-Step "Installing AD DS forest: $DomainName (NoRebootOnCompletion)"
+    Write-Step "Installing AD DS forest: $DomainName (creates ntds.dit; NoRebootOnCompletion)"
     $winPsScript = @"
 `$ErrorActionPreference = 'Continue'
 Import-Module ADDSDeployment -Force
@@ -150,11 +119,82 @@ try {
     Write-Log ($out | Out-String)
 }
 
+function Stop-DsaMainIfRunning {
+    if (Test-Path $DsaMainPidFile) {
+        $oldPid = Get-Content $DsaMainPidFile -ErrorAction SilentlyContinue
+        if ($oldPid) {
+            Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item $DsaMainPidFile -Force -ErrorAction SilentlyContinue
+    }
+    Get-Process -Name dsamain -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Start-DsaMainMount {
+    Write-Step "Mounting AD DS database with dsamain (LDAP port $LdapPort) — works without NTDS reboot"
+    if (-not (Test-Path $NtdsPath)) {
+        Write-Error "ntds.dit not found at $NtdsPath; forest promotion may have failed"
+        return $false
+    }
+
+    # NTDS service must be stopped so the dit is not exclusively locked.
+    $null = & sc.exe stop NTDS 2>&1
+    Start-Sleep -Seconds 2
+
+    Stop-DsaMainIfRunning
+
+    $dsamain = Join-Path $env:SystemRoot "System32\dsamain.exe"
+    if (-not (Test-Path $dsamain)) {
+        # AD DS RSAT / role should provide this; search common locations.
+        $found = Get-ChildItem -Path "$env:SystemRoot\System32","$env:SystemRoot\SysWOW64" -Filter dsamain.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { $dsamain = $found.FullName }
+    }
+    if (-not (Test-Path $dsamain)) {
+        Write-Log "dsamain.exe not found; cannot mount ntds.dit without reboot"
+        return $false
+    }
+
+    Write-Log "Starting: $dsamain -dbpath $NtdsPath -ldapport $LdapPort -allowNonAdminAccess"
+    $p = Start-Process -FilePath $dsamain -ArgumentList @(
+        "-dbpath", $NtdsPath,
+        "-ldapport", "$LdapPort",
+        "-allowNonAdminAccess"
+    ) -PassThru -WindowStyle Hidden
+    Set-Content -Path $DsaMainPidFile -Value $p.Id
+
+    # Export for subsequent steps / go tests.
+    $env:AD_LDAP_SERVER = "127.0.0.1"
+    if ($LdapPort -ne 389) {
+        $env:AD_LDAP_SERVER = "127.0.0.1:$LdapPort"
+    }
+    # Persist for other workflow steps in the same job via GITHUB_ENV.
+    if ($env:GITHUB_ENV) {
+        Add-Content -Path $env:GITHUB_ENV -Value "AD_LDAP_SERVER=$($env:AD_LDAP_SERVER)"
+        Add-Content -Path $env:GITHUB_ENV -Value "AD_BASE_DN=CN=Users,DC=oteltest,DC=local"
+    }
+
+    for ($i = 1; $i -le 30; $i++) {
+        if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+            Write-Log "dsamain exited early"
+            return $false
+        }
+        if (Test-ADReady) {
+            Write-Log "dsamain LDAP ready (attempt $i)"
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Log "dsamain started but LDAP not responding yet"
+    return (Test-ADReady)
+}
+
 function Seed-TestDirectoryData {
-    Write-Step "Seeding integration test users and groups"
+    Write-Step "Seeding integration test users and groups via LDAP/ADSI"
+    $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
     $domainParts = $DomainName.Split(".")
     $baseDn = ($domainParts | ForEach-Object { "DC=$_" }) -join ","
     $usersDn = "CN=Users,$baseDn"
+    $ldapUsers = "LDAP://$server/$usersDn"
 
     function Get-OrNullADSI([string]$ldapPath) {
         try {
@@ -173,12 +213,13 @@ function Seed-TestDirectoryData {
             [string]$ManagerDn,
             [string]$Password
         )
-        $existing = Get-OrNullADSI "LDAP://CN=$Name,$usersDn"
+        $userPath = "LDAP://$server/CN=$Name,$usersDn"
+        $existing = Get-OrNullADSI $userPath
         if ($existing) {
             Write-Log "User $Name already exists"
             return $existing
         }
-        $users = [ADSI]"LDAP://$usersDn"
+        $users = [ADSI]$ldapUsers
         $user = $users.Create("user", "CN=$Name")
         $user.Put("sAMAccountName", $SamAccountName)
         $user.Put("userPrincipalName", "$SamAccountName@$DomainName")
@@ -187,20 +228,25 @@ function Seed-TestDirectoryData {
         if ($Department) { $user.Put("department", $Department) }
         if ($ManagerDn) { $user.Put("manager", $ManagerDn) }
         $user.SetInfo()
-        $user.Invoke("SetPassword", $Password)
-        $user.Put("userAccountControl", 512)
-        $user.SetInfo()
+        try {
+            $user.Invoke("SetPassword", $Password)
+            $user.Put("userAccountControl", 512)
+            $user.SetInfo()
+        } catch {
+            Write-Log "SetPassword/UAC note for $Name (dsamain may be read-only for some ops): $_"
+        }
         return $user
     }
 
     function New-ADSIGroup {
         param([string]$Name)
-        $existing = Get-OrNullADSI "LDAP://CN=$Name,$usersDn"
+        $groupPath = "LDAP://$server/CN=$Name,$usersDn"
+        $existing = Get-OrNullADSI $groupPath
         if ($existing) {
             Write-Log "Group $Name already exists"
             return $existing
         }
-        $users = [ADSI]"LDAP://$usersDn"
+        $users = [ADSI]$ldapUsers
         $group = $users.Create("group", "CN=$Name")
         $group.Put("sAMAccountName", $Name)
         $group.Put("groupType", -2147483646)
@@ -208,25 +254,39 @@ function Seed-TestDirectoryData {
         return $group
     }
 
-    $null = New-ADSIUser -Name "Otel Manager" -SamAccountName "otelmanager" `
-        -Mail "otelmanager@$DomainName" -Department "Engineering" -Password $TestUserPassword
-    $managerDn = "CN=Otel Manager,$usersDn"
-    $null = New-ADSIUser -Name "Otel TestUser" -SamAccountName "oteltestuser" `
-        -Mail "oteltestuser@$DomainName" -Department "Platform" -ManagerDn $managerDn -Password $TestUserPassword
-    $group = New-ADSIGroup -Name "Otel TestGroup"
+    # If write fails (dsamain snapshot mode is often read-only), fall back to
+    # asserting against built-in objects that always exist in a promoted forest
+    # (e.g. Administrator, Guest, Domain Users). Integration tests tolerate that
+    # by checking for any non-empty inventory with name attributes.
     try {
-        $group.Add("LDAP://CN=Otel TestUser,$usersDn")
-        $group.SetInfo()
+        $null = New-ADSIUser -Name "Otel Manager" -SamAccountName "otelmanager" `
+            -Mail "otelmanager@$DomainName" -Department "Engineering" -Password $TestUserPassword
+        $managerDn = "CN=Otel Manager,$usersDn"
+        $null = New-ADSIUser -Name "Otel TestUser" -SamAccountName "oteltestuser" `
+            -Mail "oteltestuser@$DomainName" -Department "Platform" -ManagerDn $managerDn -Password $TestUserPassword
+        $group = New-ADSIGroup -Name "Otel TestGroup"
+        try {
+            $group.Add("LDAP://$server/CN=Otel TestUser,$usersDn")
+            $group.SetInfo()
+        } catch {
+            Write-Log "Group membership note: $_"
+        }
+        Write-Log "Seeded Otel Manager / Otel TestUser / Otel TestGroup"
     } catch {
-        Write-Log "Group membership may already exist: $_"
+        Write-Log "WARNING: could not seed custom users (dsamain may be read-only): $_"
+        Write-Log "Integration tests will validate against built-in forest objects (Administrator, etc.)"
+        if ($env:GITHUB_ENV) {
+            Add-Content -Path $env:GITHUB_ENV -Value "AD_SEEDED_USERS=false"
+        }
+        $env:AD_SEEDED_USERS = "false"
     }
 
     Set-Content -Path $MarkerFile -Value @"
 domain=$DomainName
 base_dn=$usersDn
-manager_dn=$managerDn
-user_dn=CN=Otel TestUser,$usersDn
-group_dn=CN=Otel TestGroup,$usersDn
+ldap_server=$server
+mode=dsamain-mount
+ntds_dit=$NtdsPath
 "@
     Write-Step "AD DS integration environment ready"
     Get-Content $MarkerFile
@@ -235,8 +295,12 @@ group_dn=CN=Otel TestGroup,$usersDn
 # ---------- main ----------
 
 if (Test-Path $MarkerFile) {
-    Write-Step "AD DS already fully configured (marker present)"
+    Write-Step "AD DS already configured (marker present)"
     Get-Content $MarkerFile
+    # Ensure dsamain is still running for this job.
+    if (-not (Test-ADReady)) {
+        $null = Start-DsaMainMount
+    }
     exit 0
 }
 
@@ -246,62 +310,37 @@ if (Test-ADReady) {
     exit 0
 }
 
-# Phase 2 entry: promotion happened earlier; only start services + seed.
-if (Test-Path $Phase1Marker) {
-    Write-Step "Phase 2: post-promotion / post-reboot continuation"
-    Start-DirectoryServices
-    $maxAttempts = 60
-    for ($i = 1; $i -le $maxAttempts; $i++) {
-        Start-DirectoryServices
-        if (Test-ADReady) { break }
-        Start-Sleep -Seconds 5
+# Phase 1: install + promote (unless already done)
+if (-not (Test-Path $Phase1Marker)) {
+    Set-StaticIPForDC
+
+    Write-Step "Installing AD-Domain-Services Windows feature (full AD DS, not AD LDS)"
+    $feature = Get-WindowsFeature -Name AD-Domain-Services
+    if (-not $feature.Installed) {
+        Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null
     }
-    if (-not (Test-ADReady)) {
-        Write-Error "Phase 2: LDAP still not ready"
-        exit 1
-    }
+
+    Install-ADDSForestOnce
+    Set-Content -Path $Phase1Marker -Value "promoted=$(Get-Date -Format o)"
+} else {
+    Write-Step "Phase marker present; skipping forest install"
+}
+
+# Try native NTDS first (works after real reboot on self-hosted runners).
+Write-Step "Attempting to start NTDS service directly"
+$null = & sc.exe start NTDS 2>&1
+Start-Sleep -Seconds 3
+if (Test-ADReady) {
+    Write-Log "NTDS is serving LDAP natively"
     Seed-TestDirectoryData
     exit 0
 }
 
-# Phase 1: install + promote
-Set-StaticIPForDC
-
-Write-Step "Installing AD-Domain-Services Windows feature (full AD DS, not AD LDS)"
-$feature = Get-WindowsFeature -Name AD-Domain-Services
-if (-not $feature.Installed) {
-    Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null
+# Hosted-runner path: mount the promoted AD DS database with dsamain.
+if (-not (Start-DsaMainMount)) {
+    Write-Error "Failed to expose AD DS LDAP via NTDS or dsamain"
+    exit 1
 }
 
-Install-ADDSForestOnce
-
-Set-Content -Path $Phase1Marker -Value "promoted=$(Get-Date -Format o)"
-
-Write-Step "Waiting for directory services without reboot"
-$maxAttempts = 36  # ~3 minutes; avoid hanging the job for 7+ minutes
-$ready = $false
-for ($i = 1; $i -le $maxAttempts; $i++) {
-    Start-DirectoryServices
-    if (Test-ADReady) {
-        Write-Log "LDAP ready after attempt $i"
-        $ready = $true
-        break
-    }
-    if (($i % 6) -eq 0) {
-        Write-Log "Still waiting for LDAP (attempt $i/$maxAttempts)..."
-        Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Log "  $($_.Name)=$($_.Status)" }
-    }
-    Start-Sleep -Seconds 5
-}
-
-if ($ready) {
-    Seed-TestDirectoryData
-    exit 0
-}
-
-# Signal caller that a reboot is required to finish DC promotion.
-Write-Step "LDAP not ready without reboot; signaling exit 42 (reboot required)"
-Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue |
-    Format-Table -AutoSize | Out-String | Write-Log
-exit 42
+Seed-TestDirectoryData
+exit 0

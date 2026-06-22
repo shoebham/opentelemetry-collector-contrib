@@ -7,6 +7,7 @@ package activedirectoryinvreceiver // import "github.com/open-telemetry/opentele
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 
 	adsi "github.com/go-adsi/adsi"
@@ -22,12 +23,20 @@ var (
 
 type adsiClient struct{}
 
+// ldapServerEnv is set by integration CI when AD DS is exposed via dsamain on
+// a specific host (e.g. 127.0.0.1) because NTDS cannot start without reboot on
+// hosted GitHub Actions runners.
+const ldapServerEnv = "AD_LDAP_SERVER"
+
 func (*adsiClient) Open(path string) (Container, error) {
 	client, err := adsi.NewClient()
 	if err != nil {
 		return nil, err
 	}
 	ldapPath := fmt.Sprintf("LDAP://%s", path)
+	if server := os.Getenv(ldapServerEnv); server != "" {
+		ldapPath = fmt.Sprintf("LDAP://%s/%s", server, path)
+	}
 	root, err := client.Open(ldapPath)
 	if err != nil {
 		return nil, err
