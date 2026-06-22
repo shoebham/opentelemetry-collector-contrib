@@ -168,22 +168,32 @@ function Start-DsaMainMount {
     $mountDit = Join-Path $mountDir "ntds.dit"
     Write-Log "Copied ntds.dit to $mountDit size=$((Get-Item $mountDit).Length)"
 
-    # Soft-recover the copy if the jet database was left dirty mid-promotion.
+    # DIT must be consistent (ESE logs replayed) before dsamain will accept it.
     $esentutl = Join-Path $env:SystemRoot "System32\esentutl.exe"
     if (Test-Path $esentutl) {
-        Write-Log "Running esentutl /r against mount dir if needed"
+        Write-Log "Recovering ESE database with esentutl /r and /p if needed"
         Push-Location $mountDir
         try {
-            & $esentutl /r edb /l $mountDir /s $mountDir 2>&1 | ForEach-Object { Write-Log "esentutl: $_" }
-        } catch {
-            Write-Log "esentutl note: $_"
-        }
+            & $esentutl /r edb /l $mountDir /s $mountDir 2>&1 | ForEach-Object { Write-Log "esentutl-r: $_" }
+        } catch { Write-Log "esentutl /r note: $_" }
+        try {
+            # /p repairs if still dirty; non-interactive via echo y if prompted is unreliable, so /p only if /mh shows dirty
+            $mh = & $esentutl /mh $mountDit 2>&1 | Out-String
+            Write-Log "esentutl /mh: $($mh.Substring(0, [Math]::Min(500, $mh.Length)))"
+            if ($mh -match "State:\s*Dirty|Dirty Shutdown") {
+                Write-Log "Database dirty; running esentutl /p"
+                echo Y | & $esentutl /p $mountDit 2>&1 | ForEach-Object { Write-Log "esentutl-p: $_" }
+            }
+        } catch { Write-Log "esentutl /mh|/p note: $_" }
         Pop-Location
     }
 
-    # Try a few ports: 389 may be held by a half-started NTDS/ADWS; 10389 is the usual dsamain lab port.
-    $portsToTry = @($LdapPort, 10389, 3389)
-    $portsToTry = $portsToTry | Select-Object -Unique
+    $logPath = Join-Path $mountDir "logs"
+    New-Item -ItemType Directory -Path $logPath -Force | Out-Null
+
+    # dsamain help requires: -dbpath, -ldapPort (capital P), optional -logpath, -allowNonAdminAccess, -allowUpgrade
+    # Wrong arg style prints help and exits — that was our previous failure mode.
+    $portsToTry = @(10389, $LdapPort, 31389) | Select-Object -Unique
 
     foreach ($port in $portsToTry) {
         Stop-DsaMainIfRunning
@@ -191,14 +201,15 @@ function Start-DsaMainMount {
         $stderrLog = "C:\otel-dsamain-$port.err.log"
         Remove-Item $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
 
-        # dsamain accepts both - and / switch styles; use slash form (documented in AD DS tools).
-        $args = @(
-            "/dbpath:$mountDit",
-            "/ldapport:$port",
-            "/allowNonAdminAccess"
+        $argList = @(
+            "-dbpath", $mountDit,
+            "-logpath", $logPath,
+            "-ldapPort", "$port",
+            "-allowNonAdminAccess",
+            "-allowUpgrade"
         )
-        Write-Log "Starting: $dsamain $($args -join ' ')"
-        $p = Start-Process -FilePath $dsamain -ArgumentList $args `
+        Write-Log "Starting: $dsamain $($argList -join ' ')"
+        $p = Start-Process -FilePath $dsamain -ArgumentList $argList `
             -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutLog `
             -RedirectStandardError $stderrLog
@@ -206,16 +217,16 @@ function Start-DsaMainMount {
 
         $env:AD_LDAP_SERVER = if ($port -eq 389) { "127.0.0.1" } else { "127.0.0.1:$port" }
         if ($env:GITHUB_ENV) {
-            Add-Content -Path $env:GITHUB_ENV -Value "AD_LDAP_SERVER=$($env:AD_LDAP_SERVER)"
-            Add-Content -Path $env:GITHUB_ENV -Value "AD_BASE_DN=CN=Users,DC=oteltest,DC=local"
+            # Overwrite-friendly: append; later steps read latest env file value is first-wins in GHA, so set once outside loop ideally.
+            # Re-set each successful port attempt only after ready check below.
         }
 
         $ready = $false
-        for ($i = 1; $i -le 20; $i++) {
+        for ($i = 1; $i -le 30; $i++) {
             if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
                 Write-Log "dsamain exited early on port $port"
-                if (Test-Path $stderrLog) { Get-Content $stderrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Log "dsamain-err: $_" } }
-                if (Test-Path $stdoutLog) { Get-Content $stdoutLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Log "dsamain-out: $_" } }
+                if (Test-Path $stderrLog) { Get-Content $stderrLog -ErrorAction SilentlyContinue | Select-Object -Last 30 | ForEach-Object { Write-Log "dsamain-err: $_" } }
+                if (Test-Path $stdoutLog) { Get-Content $stdoutLog -ErrorAction SilentlyContinue | Select-Object -Last 30 | ForEach-Object { Write-Log "dsamain-out: $_" } }
                 break
             }
             if (Test-ADReady) {
@@ -226,30 +237,12 @@ function Start-DsaMainMount {
             Start-Sleep -Seconds 2
         }
 
-        if ($ready) { return $true }
-
-        Stop-DsaMainIfRunning
-        # Fallback arg style with spaces (some builds prefer this)
-        Write-Log "Retrying dsamain with space-separated args on port $port"
-        $p2 = Start-Process -FilePath $dsamain -ArgumentList @(
-            "/dbpath", $mountDit,
-            "/ldapport", "$port",
-            "/allowNonAdminAccess"
-        ) -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $stdoutLog `
-            -RedirectStandardError $stderrLog
-        Set-Content -Path $DsaMainPidFile -Value $p2.Id
-        for ($i = 1; $i -le 15; $i++) {
-            if (-not (Get-Process -Id $p2.Id -ErrorAction SilentlyContinue)) {
-                Write-Log "dsamain retry exited early on port $port"
-                if (Test-Path $stderrLog) { Get-Content $stderrLog -ErrorAction SilentlyContinue | Select-Object -Last 20 | ForEach-Object { Write-Log "dsamain-err: $_" } }
-                break
+        if ($ready) {
+            if ($env:GITHUB_ENV) {
+                Add-Content -Path $env:GITHUB_ENV -Value "AD_LDAP_SERVER=$($env:AD_LDAP_SERVER)"
+                Add-Content -Path $env:GITHUB_ENV -Value "AD_BASE_DN=CN=Users,DC=oteltest,DC=local"
             }
-            if (Test-ADReady) {
-                Write-Log "dsamain LDAP ready via retry on port $port"
-                return $true
-            }
-            Start-Sleep -Seconds 2
+            return $true
         }
         Stop-DsaMainIfRunning
     }
