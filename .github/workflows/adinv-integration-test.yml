@@ -30,7 +30,9 @@ env:
   AD_SAFE_MODE_PASSWORD: "P@ssw0rd123!SafeMode"
   AD_TEST_USER_PASSWORD: "P@ssw0rd123!User"
   AD_BASE_DN: "CN=Users,DC=oteltest,DC=local"
-  AD_LDAP_SERVER: "127.0.0.1"
+  # Default; setup-ad-ds.ps1 overwrites via GITHUB_ENV when dsamain uses 10389.
+  AD_LDAP_SERVER: "127.0.0.1:10389"
+  AD_SEEDED_USERS: "false"
 
 jobs:
   adinv-integration:
@@ -70,16 +72,24 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
           Write-Host "Probing LDAP via server=$server"
-          # Fast TCP probe (Test-NetConnection hangs for minutes when port is closed)
-          $tcp = New-Object System.Net.Sockets.TcpClient
-          $iar = $tcp.BeginConnect("127.0.0.1", 389, $null, $null)
-          if (-not $iar.AsyncWaitHandle.WaitOne(3000, $false)) {
-            $tcp.Close()
-            throw "TCP 127.0.0.1:389 not accepting connections within 3s"
+          # Parse host:port from AD_LDAP_SERVER (dsamain often listens on 10389, not 389)
+          $host = "127.0.0.1"
+          $port = 389
+          if ($server -match '^([^:]+):(\d+)$') {
+            $host = $Matches[1]
+            $port = [int]$Matches[2]
+          } elseif ($server) {
+            $host = $server
           }
-          $tcp.EndConnect($iar)
+          $tcp = New-Object System.Net.Sockets.TcpClient
+          $iar = $tcp.BeginConnect($host, $port, $null, $null)
+          if (-not $iar.AsyncWaitHandle.WaitOne(5000, $false)) {
+            $tcp.Close()
+            throw "TCP ${host}:${port} not accepting connections within 5s"
+          }
+          try { $tcp.EndConnect($iar) } catch { $tcp.Close(); throw "TCP ${host}:${port} connect failed: $_" }
           $tcp.Close()
-          Write-Host "TCP 389 open"
+          Write-Host "TCP ${host}:${port} open"
           $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$server/RootDSE")
           $nc = $root.Properties["defaultNamingContext"].Value
           Write-Host "defaultNamingContext=$nc"
