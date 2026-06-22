@@ -9,5 +9,5 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
+	// go-adsi/comshim retains a COM apartment worker for the process lifetime.
+	goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("github.com/scjalliance/comshim.(*Shim).run.func1"))

@@ -11,3 +11,8 @@ status:
 tests:
   skip_lifecycle: true
   skip_shutdown: true
+  # go-adsi/comshim keeps a COM apartment goroutine for process lifetime.
+  goleak:
+    ignore:
+      any:
+        - "github.com/scjalliance/comshim.(*Shim).run.func1"
