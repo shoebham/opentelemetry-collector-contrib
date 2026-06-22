@@ -1,5 +1,20 @@
 # Integration tests for receiver/activedirectoryinvreceiver against a real
 # Windows Active Directory Domain Services forest (full AD DS, not AD LDS).
+#
+# AD DS forest promotion normally requires a reboot. Hosted runners lose the
+# job on reboot, so we try to bring NTDS/LDAP up without rebooting first. If
+# that fails (exit 42 from setup script), we reboot via a scheduled task that
+# re-invokes the runner job steps is not possible; instead we use an in-job
+# reboot with a startup scheduled task that writes a phase marker and the
+# workflow is designed as a single job that:
+#   1) promotes AD (phase 1)
+#   2) if exit 42, registers a one-shot startup task + reboots
+#   3) after reboot the runner agent is dead on hosted runners, so we ALSO
+#      attempt a no-reboot path aggressively.
+#
+# On windows-2025 hosted runners we prioritize the no-reboot path. If LDAP
+# still fails, the job fails with diagnostics (reboot is not recoverable on
+# hosted runners mid-job).
 name: adinv-integration-test
 
 on:
@@ -26,15 +41,13 @@ env:
   AD_SAFE_MODE_PASSWORD: "P@ssw0rd123!SafeMode"
   AD_TEST_USER_PASSWORD: "P@ssw0rd123!User"
   AD_BASE_DN: "CN=Users,DC=oteltest,DC=local"
-  # Make sure to exit early if cache segment download times out after 2 minutes.
   SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
 
 jobs:
   adinv-integration:
     name: AD DS inventory integration
-    # windows-2025 has Server SKU with AD DS role available.
     runs-on: windows-2025
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -44,17 +57,42 @@ jobs:
         with:
           go-version: oldstable
 
-      # Hosted runners cannot reboot mid-job; promotion uses -NoRebootOnCompletion
-      # and the setup script force-starts NTDS/ADWS/DNS for LDAP access.
       - name: Install and configure full AD DS forest
+        id: setup_ad
         shell: powershell
         run: |
           $script = Join-Path $env:GITHUB_WORKSPACE "receiver\activedirectoryinvreceiver\testdata\integration\setup-ad-ds.ps1"
           & $script
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $code = $LASTEXITCODE
+          Write-Host "setup-ad-ds.ps1 exit code: $code"
+          if ($code -eq 42) {
+            Write-Host "Reboot required after promotion; attempting in-session service recovery loop..."
+            # One more aggressive service start pass without reboot (hosted runners cannot continue after reboot).
+            $services = @("NTDS", "ADWS", "DNS", "Netlogon", "Kdc")
+            for ($i = 1; $i -le 24; $i++) {
+              foreach ($svc in $services) {
+                $null = & sc.exe start $svc 2>&1
+              }
+              try {
+                $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+                $nc = $root.Properties["defaultNamingContext"].Value
+                if ($nc) {
+                  Write-Host "LDAP became ready: $nc"
+                  # Re-run setup for phase2/seeding
+                  & $script
+                  if ($LASTEXITCODE -eq 0) { exit 0 }
+                }
+              } catch {}
+              Start-Sleep -Seconds 5
+            }
+            Write-Error "AD DS requires reboot to serve LDAP; hosted runner cannot reboot mid-job and recover. See setup log C:\otel-ad-ds-setup.log"
+            if (Test-Path C:\otel-ad-ds-setup.log) { Get-Content C:\otel-ad-ds-setup.log | Select-Object -Last 80 }
+            exit 1
+          }
+          if ($code -ne 0) { exit $code }
 
       - name: Verify AD DS is reachable via LDAP/ADSI
-        shell: pwsh
+        shell: powershell
         run: |
           $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
           $nc = $root.Properties["defaultNamingContext"].Value
@@ -67,7 +105,7 @@ jobs:
 
       - name: Run activedirectoryinvreceiver integration tests
         working-directory: receiver/activedirectoryinvreceiver
-        shell: pwsh
+        shell: powershell
         env:
           AD_BASE_DN: ${{ env.AD_BASE_DN }}
         run: |
@@ -75,17 +113,22 @@ jobs:
 
       - name: Dump AD / system diagnostics on failure
         if: failure()
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "==== Services ===="
           Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
-          Write-Host "==== Marker file ===="
-          if (Test-Path C:\otel-ad-ds-ready.marker) { Get-Content C:\otel-ad-ds-ready.marker } else { Write-Host "(missing)" }
+          Write-Host "==== Marker / phase files ===="
+          foreach ($f in @("C:\otel-ad-ds-ready.marker", "C:\otel-ad-phase1.marker", "C:\otel-ad-ds-setup.log")) {
+            Write-Host "--- $f ---"
+            if (Test-Path $f) { Get-Content $f | Select-Object -Last 60 } else { Write-Host "(missing)" }
+          }
           Write-Host "==== RootDSE probe ===="
           try {
             $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
             $root.Properties.PropertyNames | ForEach-Object { "$_=$($root.Properties[$_].Value)" } | Write-Host
           } catch { Write-Host "RootDSE failed: $_" }
+          Write-Host "==== Port 389 ===="
+          try { Test-NetConnection -ComputerName 127.0.0.1 -Port 389 | Format-List | Out-String | Write-Host } catch {}
           Write-Host "==== Recent Directory Service events ===="
           try {
             Get-WinEvent -LogName "Directory Service" -MaxEvents 20 -ErrorAction SilentlyContinue |
