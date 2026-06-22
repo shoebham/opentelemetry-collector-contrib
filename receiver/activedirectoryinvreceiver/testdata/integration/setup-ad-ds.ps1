@@ -91,30 +91,30 @@ function Set-StaticIPForDC {
 }
 
 function Install-ADDSForestOnce {
-    Write-Step "Installing AD DS forest: $DomainName (creates ntds.dit; NoRebootOnCompletion)"
-    $winPsScript = @"
-`$ErrorActionPreference = 'Continue'
-Import-Module ADDSDeployment -Force
-`$securePw = ConvertTo-SecureString '$SafeModePassword' -AsPlainText -Force
-try {
-    `$r = Install-ADDSForest ``
-        -DomainName '$DomainName' ``
-        -DomainNetbiosName '$DomainNetbiosName' ``
-        -SafeModeAdministratorPassword `$securePw ``
-        -InstallDns:`$true ``
-        -NoRebootOnCompletion:`$true ``
-        -Force:`$true ``
-        -CreateDnsDelegation:`$false ``
-        -DatabasePath 'C:\Windows\NTDS' ``
-        -LogPath 'C:\Windows\NTDS' ``
-        -SysvolPath 'C:\Windows\SYSVOL'
-    `$r | Format-List | Out-String | Write-Output
-} catch {
-    Write-Output "INSTALL_ERROR: `$_"
-}
-"@
+    Write-Step "Installing AD DS forest: $DomainName - creates ntds.dit with NoRebootOnCompletion"
     $winPsScriptPath = "$env:TEMP\otel-install-addsforest.ps1"
-    Set-Content -Path $winPsScriptPath -Value $winPsScript -Encoding UTF8
+    $lines = @(
+        "`$ErrorActionPreference = 'Continue'"
+        "Import-Module ADDSDeployment -Force"
+        "`$securePw = ConvertTo-SecureString '$SafeModePassword' -AsPlainText -Force"
+        "try {"
+        "    `$r = Install-ADDSForest ``"
+        "        -DomainName '$DomainName' ``"
+        "        -DomainNetbiosName '$DomainNetbiosName' ``"
+        "        -SafeModeAdministratorPassword `$securePw ``"
+        "        -InstallDns:`$true ``"
+        "        -NoRebootOnCompletion:`$true ``"
+        "        -Force:`$true ``"
+        "        -CreateDnsDelegation:`$false ``"
+        "        -DatabasePath 'C:\Windows\NTDS' ``"
+        "        -LogPath 'C:\Windows\NTDS' ``"
+        "        -SysvolPath 'C:\Windows\SYSVOL'"
+        "    `$r | Format-List | Out-String | Write-Output"
+        "} catch {"
+        "    Write-Output `"INSTALL_ERROR: `$_`""
+        "}"
+    )
+    Set-Content -Path $winPsScriptPath -Value $lines -Encoding UTF8
     $out = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $winPsScriptPath 2>&1
     Write-Log ($out | Out-String)
 }
@@ -131,7 +131,7 @@ function Stop-DsaMainIfRunning {
 }
 
 function Start-DsaMainMount {
-    Write-Step "Mounting AD DS database with dsamain (LDAP port $LdapPort) — works without NTDS reboot"
+    Write-Step "Mounting AD DS database with dsamain on LDAP port $LdapPort - works without NTDS reboot"
     if (-not (Test-Path $NtdsPath)) {
         Write-Error "ntds.dit not found at $NtdsPath; forest promotion may have failed"
         return $false
@@ -233,7 +233,7 @@ function Seed-TestDirectoryData {
             $user.Put("userAccountControl", 512)
             $user.SetInfo()
         } catch {
-            Write-Log "SetPassword/UAC note for $Name (dsamain may be read-only for some ops): $_"
+            Write-Log "SetPassword/UAC note for $Name - dsamain may be read-only for some ops: $_"
         }
         return $user
     }
@@ -273,8 +273,8 @@ function Seed-TestDirectoryData {
         }
         Write-Log "Seeded Otel Manager / Otel TestUser / Otel TestGroup"
     } catch {
-        Write-Log "WARNING: could not seed custom users (dsamain may be read-only): $_"
-        Write-Log "Integration tests will validate against built-in forest objects (Administrator, etc.)"
+        Write-Log "WARNING: could not seed custom users - dsamain may be read-only: $_"
+        Write-Log "Integration tests will validate against built-in forest objects such as Administrator"
         if ($env:GITHUB_ENV) {
             Add-Content -Path $env:GITHUB_ENV -Value "AD_SEEDED_USERS=false"
         }
