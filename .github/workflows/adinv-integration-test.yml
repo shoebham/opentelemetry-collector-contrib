@@ -1,0 +1,90 @@
+# Integration tests for receiver/activedirectoryinvreceiver against a real
+# Windows Active Directory Domain Services forest (full AD DS, not AD LDS).
+name: adinv-integration-test
+
+on:
+  push:
+    branches:
+      - main
+      - feat/adinv-integration-test
+      - "**/adinv*"
+    paths:
+      - "receiver/activedirectoryinvreceiver/**"
+      - ".github/workflows/adinv-integration-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adinv-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AD_DOMAIN_NAME: oteltest.local
+  AD_NETBIOS_NAME: OTELTEST
+  AD_SAFE_MODE_PASSWORD: "P@ssw0rd123!SafeMode"
+  AD_TEST_USER_PASSWORD: "P@ssw0rd123!User"
+  AD_BASE_DN: "CN=Users,DC=oteltest,DC=local"
+  # Make sure to exit early if cache segment download times out after 2 minutes.
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+
+jobs:
+  adinv-integration:
+    name: AD DS inventory integration
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go-tools
+        with:
+          go-version: oldstable
+
+      - name: Install and configure full AD DS forest
+        shell: pwsh
+        run: |
+          $script = Join-Path $env:GITHUB_WORKSPACE "receiver\activedirectoryinvreceiver\testdata\integration\setup-ad-ds.ps1"
+          & $script
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify AD DS is reachable via LDAP/ADSI
+        shell: pwsh
+        run: |
+          $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+          $nc = $root.Properties["defaultNamingContext"].Value
+          Write-Host "defaultNamingContext=$nc"
+          if (-not $nc) { throw "RootDSE defaultNamingContext is empty" }
+          $users = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=Users,$nc")
+          Write-Host "Opened CN=Users: $($users.Path)"
+          $user = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=Otel TestUser,CN=Users,$nc")
+          Write-Host "Seeded user mail=$($user.Properties['mail'].Value) department=$($user.Properties['department'].Value)"
+
+      - name: Run activedirectoryinvreceiver integration tests
+        working-directory: receiver/activedirectoryinvreceiver
+        shell: pwsh
+        env:
+          AD_BASE_DN: ${{ env.AD_BASE_DN }}
+        run: |
+          go test -tags=integration -timeout 10m -count=1 -v ./...
+
+      - name: Dump AD / system diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "==== Services ===="
+          Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host "==== Marker file ===="
+          if (Test-Path C:\otel-ad-ds-ready.marker) { Get-Content C:\otel-ad-ds-ready.marker } else { Write-Host "(missing)" }
+          Write-Host "==== RootDSE probe ===="
+          try {
+            $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+            $root.Properties.PropertyNames | ForEach-Object { "$_=$($root.Properties[$_].Value)" } | Write-Host
+          } catch { Write-Host "RootDSE failed: $_" }
+          Write-Host "==== Recent Directory Service events ===="
+          try {
+            Get-WinEvent -LogName "Directory Service" -MaxEvents 20 -ErrorAction SilentlyContinue |
+              Format-List TimeCreated, Id, LevelDisplayName, Message | Out-String | Write-Host
+          } catch { Write-Host "No Directory Service events: $_" }
