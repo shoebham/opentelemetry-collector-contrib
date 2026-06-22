@@ -39,35 +39,52 @@ function Write-Log($msg) {
     Add-Content -Path $SetupLog -Value "$(Get-Date -Format o) $msg" -ErrorAction SilentlyContinue
 }
 
-# GitHub Actions often looks "stuck" during Install-WindowsFeature / Install-ADDSForest
-# because those cmdlets emit little/no stdout for 10-25 minutes. Keep a heartbeat so
-# humans/agents do not cancel a healthy run.
-function Start-Heartbeat {
-    param([string]$Label, [int]$IntervalSec = 30)
-    $script:HeartbeatJob = Start-Job -ScriptBlock {
-        param($lbl, $sec)
-        $n = 0
-        while ($true) {
-            $n++
-            $elapsed = $n * $sec
-            Write-Output "[heartbeat] $lbl still running... elapsed~${elapsed}s (normal; do not cancel)"
-            Start-Sleep -Seconds $sec
-        }
-    } -ArgumentList $Label, $IntervalSec
+# GitHub Actions often looks "stuck" during Install-WindowsFeature / Install-ADDSForest.
+# PowerShell jobs do NOT reliably surface in GHA logs; emit heartbeats on the main thread
+# with explicit console flush so lines always appear.
+function Write-HeartbeatLine {
+    param([string]$Label, [int]$ElapsedSec)
+    $line = "[heartbeat $(Get-Date -Format 'HH:mm:ss')] $Label still running... elapsed~${ElapsedSec}s (normal; do not cancel)"
+    Write-Host $line
+    try { [Console]::Out.Flush() } catch {}
+    Add-Content -Path $SetupLog -Value "$(Get-Date -Format o) $line" -ErrorAction SilentlyContinue
 }
 
-function Stop-Heartbeat {
-    if ($script:HeartbeatJob) {
-        Stop-Job $script:HeartbeatJob -ErrorAction SilentlyContinue
-        Receive-Job $script:HeartbeatJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-        Remove-Job $script:HeartbeatJob -Force -ErrorAction SilentlyContinue
-        $script:HeartbeatJob = $null
+function Wait-ProcessWithHeartbeat {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Label,
+        [int]$IntervalSec = 15
+    )
+    $started = Get-Date
+    $lastBeat = $started.AddSeconds(-$IntervalSec)
+    while (-not $Process.HasExited) {
+        $now = Get-Date
+        if (($now - $lastBeat).TotalSeconds -ge $IntervalSec) {
+            $elapsed = [int]($now - $started).TotalSeconds
+            Write-HeartbeatLine -Label $Label -ElapsedSec $elapsed
+            $lastBeat = $now
+        }
+        Start-Sleep -Seconds 2
     }
 }
 
-function Receive-Heartbeat {
-    if ($script:HeartbeatJob) {
-        Receive-Job $script:HeartbeatJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+function Wait-JobWithHeartbeat {
+    param(
+        $Job,
+        [string]$Label,
+        [int]$IntervalSec = 15
+    )
+    $started = Get-Date
+    $lastBeat = $started.AddSeconds(-$IntervalSec)
+    while ($Job.State -eq 'Running') {
+        $now = Get-Date
+        if (($now - $lastBeat).TotalSeconds -ge $IntervalSec) {
+            $elapsed = [int]($now - $started).TotalSeconds
+            Write-HeartbeatLine -Label $Label -ElapsedSec $elapsed
+            $lastBeat = $now
+        }
+        Start-Sleep -Seconds 2
     }
 }
 
@@ -176,32 +193,24 @@ function Install-ADDSForestOnce {
         "}"
     )
     Set-Content -Path $winPsScriptPath -Value $lines -Encoding UTF8
-    Start-Heartbeat -Label "Install-ADDSForest" -IntervalSec 30
     $ok = $false
-    try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$winPsScriptPath`""
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.CreateNoWindow = $true
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        while (-not $proc.HasExited) {
-            Receive-Heartbeat
-            Start-Sleep -Seconds 5
-        }
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $stderr = $proc.StandardError.ReadToEnd()
-        if ($stdout) { Write-Log $stdout }
-        if ($stderr) { Write-Log "stderr: $stderr" }
-        Write-Log "Install-ADDSForest child exit=$($proc.ExitCode)"
-        $combined = "$stdout`n$stderr"
-        if ($proc.ExitCode -eq 0 -and $combined -notmatch "INSTALL_ERROR|INSTALL_STATUS_ERROR|Status\s*:\s*Error") {
-            $ok = $true
-        }
-    } finally {
-        Stop-Heartbeat
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$winPsScriptPath`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    Wait-ProcessWithHeartbeat -Process $proc -Label "Install-ADDSForest" -IntervalSec 15
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    if ($stdout) { Write-Log $stdout }
+    if ($stderr) { Write-Log "stderr: $stderr" }
+    Write-Log "Install-ADDSForest child exit=$($proc.ExitCode)"
+    $combined = "$stdout`n$stderr"
+    if ($proc.ExitCode -eq 0 -and $combined -notmatch "INSTALL_ERROR|INSTALL_STATUS_ERROR|Status\s*:\s*Error") {
+        $ok = $true
     }
     return $ok
 }
@@ -518,22 +527,14 @@ if (-not (Test-Path $Phase1Marker)) {
     Write-Log "NOTE: Install-WindowsFeature often takes 5-15 min; heartbeats prove progress."
     $feature = Get-WindowsFeature -Name AD-Domain-Services
     if (-not $feature.Installed) {
-        Start-Heartbeat -Label "Install-WindowsFeature AD-Domain-Services" -IntervalSec 30
-        try {
-            $featJob = Start-Job -ScriptBlock {
-                Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-String
-            }
-            while ($featJob.State -eq 'Running') {
-                Receive-Heartbeat
-                Start-Sleep -Seconds 5
-            }
-            $featOut = Receive-Job $featJob
-            Remove-Job $featJob -Force -ErrorAction SilentlyContinue
-            if ($featOut) { Write-Log ($featOut | Out-String) }
-            Write-Log "Install-WindowsFeature finished"
-        } finally {
-            Stop-Heartbeat
+        $featJob = Start-Job -ScriptBlock {
+            Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-String
         }
+        Wait-JobWithHeartbeat -Job $featJob -Label "Install-WindowsFeature AD-Domain-Services" -IntervalSec 15
+        $featOut = Receive-Job $featJob
+        Remove-Job $featJob -Force -ErrorAction SilentlyContinue
+        if ($featOut) { Write-Log ($featOut | Out-String) }
+        Write-Log "Install-WindowsFeature finished"
     } else {
         Write-Log "AD-Domain-Services already installed"
     }
