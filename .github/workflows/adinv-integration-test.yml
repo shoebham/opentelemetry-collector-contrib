@@ -1,20 +1,9 @@
 # Integration tests for receiver/activedirectoryinvreceiver against a real
 # Windows Active Directory Domain Services forest (full AD DS, not AD LDS).
 #
-# AD DS forest promotion normally requires a reboot. Hosted runners lose the
-# job on reboot, so we try to bring NTDS/LDAP up without rebooting first. If
-# that fails (exit 42 from setup script), we reboot via a scheduled task that
-# re-invokes the runner job steps is not possible; instead we use an in-job
-# reboot with a startup scheduled task that writes a phase marker and the
-# workflow is designed as a single job that:
-#   1) promotes AD (phase 1)
-#   2) if exit 42, registers a one-shot startup task + reboots
-#   3) after reboot the runner agent is dead on hosted runners, so we ALSO
-#      attempt a no-reboot path aggressively.
-#
-# On windows-2025 hosted runners we prioritize the no-reboot path. If LDAP
-# still fails, the job fails with diagnostics (reboot is not recoverable on
-# hosted runners mid-job).
+# Hosted runners cannot reboot mid-job, so after Install-ADDSForest we mount
+# the promoted ntds.dit with dsamain.exe (AD DS tool) on localhost:389 and
+# point ADSI via AD_LDAP_SERVER=127.0.0.1.
 name: adinv-integration-test
 
 on:
@@ -41,43 +30,56 @@ env:
   AD_SAFE_MODE_PASSWORD: "P@ssw0rd123!SafeMode"
   AD_TEST_USER_PASSWORD: "P@ssw0rd123!User"
   AD_BASE_DN: "CN=Users,DC=oteltest,DC=local"
-  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+  AD_LDAP_SERVER: "127.0.0.1"
 
 jobs:
   adinv-integration:
     name: AD DS inventory integration
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      # Skip full-repo gomoddownload — only this receiver module is tested.
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: oldstable
           cache-dependency-path: receiver/activedirectoryinvreceiver/go.sum
 
-      # Install AD first (slowest step) before go deps so we fail fast if AD cannot start.
       - name: Install and configure full AD DS forest
         id: setup_ad
+        timeout-minutes: 50
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Continue'
           $script = Join-Path $env:GITHUB_WORKSPACE "receiver\activedirectoryinvreceiver\testdata\integration\setup-ad-ds.ps1"
           & $script
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "==== setup log ===="
-            if (Test-Path C:\otel-ad-ds-setup.log) { Get-Content C:\otel-ad-ds-setup.log }
-            exit $LASTEXITCODE
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host "==== setup log tail ===="
+            if (Test-Path C:\otel-ad-ds-setup.log) { Get-Content C:\otel-ad-ds-setup.log -Tail 100 }
+            exit $code
           }
           Write-Host "AD_LDAP_SERVER=$env:AD_LDAP_SERVER AD_SEEDED_USERS=$env:AD_SEEDED_USERS"
 
       - name: Verify AD DS is reachable via LDAP/ADSI
+        timeout-minutes: 2
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
           Write-Host "Probing LDAP via server=$server"
+          # Fast TCP probe (Test-NetConnection hangs for minutes when port is closed)
+          $tcp = New-Object System.Net.Sockets.TcpClient
+          $iar = $tcp.BeginConnect("127.0.0.1", 389, $null, $null)
+          if (-not $iar.AsyncWaitHandle.WaitOne(3000, $false)) {
+            $tcp.Close()
+            throw "TCP 127.0.0.1:389 not accepting connections within 3s"
+          }
+          $tcp.EndConnect($iar)
+          $tcp.Close()
+          Write-Host "TCP 389 open"
           $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$server/RootDSE")
           $nc = $root.Properties["defaultNamingContext"].Value
           Write-Host "defaultNamingContext=$nc"
@@ -94,39 +96,62 @@ jobs:
           }
 
       - name: Run activedirectoryinvreceiver integration tests
+        timeout-minutes: 15
         working-directory: receiver/activedirectoryinvreceiver
         shell: powershell
         env:
           AD_BASE_DN: ${{ env.AD_BASE_DN }}
+          AD_LDAP_SERVER: ${{ env.AD_LDAP_SERVER }}
         run: |
           Write-Host "AD_LDAP_SERVER=$env:AD_LDAP_SERVER AD_BASE_DN=$env:AD_BASE_DN AD_SEEDED_USERS=$env:AD_SEEDED_USERS"
           go test -tags=integration -timeout 10m -count=1 -v ./...
 
+      # Keep this step fast: Test-NetConnection / Get-WinEvent / ADSI hang on failed runners.
       - name: Dump AD / system diagnostics on failure
         if: failure()
+        timeout-minutes: 2
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Continue'
           Write-Host "==== Services ===="
-          Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
+          try {
+            Get-Service NTDS, ADWS, DNS, Netlogon, Kdc -ErrorAction SilentlyContinue |
+              Format-Table Name, Status, StartType -AutoSize | Out-String | Write-Host
+          } catch { Write-Host "services: $_" }
+
           Write-Host "==== dsamain process ===="
-          Get-Process dsamain -ErrorAction SilentlyContinue | Format-List | Out-String | Write-Host
-          Write-Host "==== Marker / phase files ===="
+          try {
+            Get-Process dsamain -ErrorAction SilentlyContinue |
+              Format-Table Id, ProcessName, StartTime -AutoSize | Out-String | Write-Host
+          } catch { Write-Host "dsamain: $_" }
+
+          Write-Host "==== Marker / phase / log files ===="
           foreach ($f in @("C:\otel-ad-ds-ready.marker", "C:\otel-ad-phase1.marker", "C:\otel-ad-ds-setup.log", "C:\otel-dsamain.pid")) {
             Write-Host "--- $f ---"
-            if (Test-Path $f) { Get-Content $f | Select-Object -Last 80 } else { Write-Host "(missing)" }
+            if (Test-Path $f) {
+              Get-Content $f -Tail 60 -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "(missing)"
+            }
           }
-          Write-Host "==== RootDSE probe ===="
-          $server = if ($env:AD_LDAP_SERVER) { $env:AD_LDAP_SERVER } else { "127.0.0.1" }
-          try {
-            $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$server/RootDSE")
-            $root.Properties.PropertyNames | ForEach-Object { "$_=$($root.Properties[$_].Value)" } | Write-Host
-          } catch { Write-Host "RootDSE failed: $_" }
-          Write-Host "==== Port 389 ===="
-          try { Test-NetConnection -ComputerName 127.0.0.1 -Port 389 | Format-List | Out-String | Write-Host } catch {}
+
           Write-Host "==== ntds.dit ===="
-          Get-Item C:\Windows\NTDS\ntds.dit -ErrorAction SilentlyContinue | Format-List | Out-String | Write-Host
-          Write-Host "==== Recent Directory Service events ===="
           try {
-            Get-WinEvent -LogName "Directory Service" -MaxEvents 20 -ErrorAction SilentlyContinue |
-              Format-List TimeCreated, Id, LevelDisplayName, Message | Out-String | Write-Host
-          } catch { Write-Host "No Directory Service events: $_" }
+            if (Test-Path C:\Windows\NTDS\ntds.dit) {
+              Get-Item C:\Windows\NTDS\ntds.dit | Format-List FullName, Length, LastWriteTime | Out-String | Write-Host
+            } else {
+              Write-Host "(missing)"
+            }
+          } catch { Write-Host "ntds.dit: $_" }
+
+          Write-Host "==== TCP 389 quick probe ===="
+          try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $iar = $tcp.BeginConnect("127.0.0.1", 389, $null, $null)
+            $ok = $iar.AsyncWaitHandle.WaitOne(2000, $false)
+            if ($ok) { $tcp.EndConnect($iar); Write-Host "port 389 OPEN" } else { Write-Host "port 389 CLOSED/timeout" }
+            $tcp.Close()
+          } catch { Write-Host "tcp probe: $_" }
+
+          Write-Host "==== diagnostics done ===="
+          exit 0
